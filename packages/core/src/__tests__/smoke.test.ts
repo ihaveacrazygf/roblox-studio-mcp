@@ -1,0 +1,2490 @@
+import { BridgeService } from '../bridge-service.js';
+import { createHttpServer } from '../http-server.js';
+import { RobloxStudioTools } from '../tools/index.js';
+import { buildStudioLaunchArgs, cleanupManagedBaseplateFiles, StudioInstanceManager } from '../studio-instance-manager.js';
+import request from 'supertest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
+const READY = {
+  pluginSessionId: 'session-1',
+  instanceId: 'place:test',
+  role: 'edit',
+  placeId: 0,
+  placeName: 'TestPlace',
+  dataModelName: 'TestPlace',
+  isRunning: false,
+};
+
+const ZERO_NETWORK_STATE = {
+  InboundNetworkMinDelayMs: 0,
+  OutboundNetworkMinDelayMs: 0,
+  InboundNetworkJitterMs: 0,
+  OutboundNetworkJitterMs: 0,
+  InboundNetworkLossPercent: 0,
+  OutboundNetworkLossPercent: 0,
+};
+
+const DIRTY_NETWORK_STATE = {
+  InboundNetworkMinDelayMs: 50,
+  OutboundNetworkMinDelayMs: 50,
+  InboundNetworkJitterMs: 10,
+  OutboundNetworkJitterMs: 10,
+  InboundNetworkLossPercent: 0.5,
+  OutboundNetworkLossPercent: 0.5,
+};
+
+function readRegistryEvents(registryDir: string): Record<string, unknown>[] {
+  return fs.readdirSync(registryDir)
+    .filter((name) => name.startsWith('events-') && name.endsWith('.jsonl'))
+    .flatMap((name) => fs.readFileSync(path.join(registryDir, name), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line)));
+}
+
+describe('Smoke', () => {
+  test('source does not force playtest shutdown with brittle fallbacks', () => {
+    const cwd = process.cwd();
+    const repoRoot = fs.existsSync(path.join(cwd, 'studio-plugin')) ? cwd : path.resolve(cwd, '../..');
+    const guardedFiles = [
+      path.join(repoRoot, 'packages/core/src/tools/index.ts'),
+      path.join(repoRoot, 'studio-plugin/src/modules/ClientBroker.ts'),
+      path.join(repoRoot, 'studio-plugin/src/modules/Communication.ts'),
+      path.join(repoRoot, 'studio-plugin/src/modules/handlers/TestHandlers.ts'),
+    ];
+
+    for (const file of guardedFiles) {
+      const source = fs.readFileSync(file, 'utf8');
+      expect(source).not.toMatch(/RunService\s*[:.]\s*Stop\s*\(/);
+      expect(source).not.toContain('/api/force-stop-runtime');
+      expect(source).not.toContain('runtime_runservice_stop');
+      expect(source).not.toContain('windows_shift_f5');
+      expect(source).not.toContain('WScript.Shell');
+      expect(source).not.toContain('SendKeys');
+      expect(source).not.toContain('powershell.exe');
+    }
+  });
+
+  test('BridgeService instantiable', () => {
+    const bridge = new BridgeService();
+    expect(bridge).toBeDefined();
+    expect(bridge.getPendingRequest('place:nope', 'edit')).toBeNull();
+  });
+
+  test('HTTP server starts and responds to health check', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    const app = createHttpServer(tools, bridge);
+
+    const response = await request(app).get('/health').expect(200);
+    expect(response.body.status).toBe('ok');
+    expect(response.body.service).toBe('robloxstudio-mcp');
+  });
+
+  test('clearAllPendingRequests rejects all pending', async () => {
+    const bridge = new BridgeService();
+    const p1 = bridge.sendRequest('/test1', {}, 'place:test', 'edit');
+    const p2 = bridge.sendRequest('/test2', {}, 'place:test', 'edit');
+    expect(bridge.getPendingRequest('place:test', 'edit')).toBeTruthy();
+    bridge.clearAllPendingRequests();
+    expect(bridge.getPendingRequest('place:test', 'edit')).toBeNull();
+    await expect(p1).rejects.toThrow('Connection closed');
+    await expect(p2).rejects.toThrow('Connection closed');
+  });
+
+  test('Disconnect rejects pending requests for that (instanceId, role)', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    const app = createHttpServer(tools, bridge);
+
+    await request(app).post('/ready').send(READY).expect(200);
+    const pending = bridge.sendRequest('/test', {}, 'place:test', 'edit');
+    pending.catch(() => {});
+    await request(app).post('/disconnect').send({ pluginSessionId: 'session-1' }).expect(200);
+    await expect(pending).rejects.toThrow(/disconnected/);
+  });
+
+  test('Connection state lifecycle', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    const app = createHttpServer(tools, bridge) as any;
+    expect(app.isPluginConnected()).toBe(false);
+    await request(app).post('/ready').send(READY).expect(200);
+    expect(app.isPluginConnected()).toBe(true);
+    await request(app).post('/disconnect').send({ pluginSessionId: 'session-1' }).expect(200);
+    expect(app.isPluginConnected()).toBe(false);
+  });
+
+  test('start_playtest rejects numPlayers', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    await expect(tools.startPlaytest('play', 1)).rejects.toThrow(/multiplayer_playtest/);
+  });
+
+  test('manage_instance blocks launching an already connected latest published place', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance({
+      ...READY,
+      instanceId: 'place:123',
+      placeId: 123,
+    });
+    const launch = jest.fn();
+    (tools as any).instanceManager = {
+      list: () => [],
+      launch,
+    };
+
+    const result = await tools.manageInstance({
+      action: 'launch',
+      source: 'published_place',
+      place_id: 123,
+      wait_for_connection: false,
+    });
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      error: 'Place is already open.',
+      message: 'place_id 123 is already connected. Use the existing instance or launch a specific place_revision.',
+    });
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  test('manage_instance allows launching an explicit past revision for an already connected place', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance({
+      ...READY,
+      instanceId: 'place:123',
+      placeId: 123,
+    });
+    const launch = jest.fn(async (options) => ({
+      ...options,
+      exe: 'RobloxStudioBeta.exe',
+      args: [],
+      launchedAt: Date.now(),
+    }));
+    (tools as any).instanceManager = {
+      list: () => [],
+      launch,
+    };
+    jest.spyOn(tools as any, '_deriveUniverseId').mockResolvedValue(456);
+
+    const result = await tools.manageInstance({
+      action: 'launch',
+      source: 'place_revision',
+      place_id: 123,
+      place_version: 7,
+      wait_for_connection: false,
+    });
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({ message: 'Studio launch requested.' });
+    expect(launch).toHaveBeenCalledWith({
+      source: 'place_revision',
+      localPlaceFile: undefined,
+      placeId: 123,
+      universeId: 456,
+      placeVersion: 7,
+    });
+  });
+
+  test('manage_instance baseplate launch does not parse non-dependent launch inputs', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    const launch = jest.fn(async (options) => ({
+      ...options,
+      exe: 'RobloxStudioBeta.exe',
+      args: [],
+      launchedAt: Date.now(),
+    }));
+    (tools as any).instanceManager = {
+      list: () => [],
+      launch,
+    };
+
+    const result = await tools.manageInstance({
+      action: 'launch',
+      source: 'baseplate',
+      place_id: 'not-needed',
+      place_version: 'not-needed',
+      universe_id: 'not-accepted',
+      wait_for_connection: false,
+    });
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({ message: 'Studio launch requested.' });
+    expect(launch).toHaveBeenCalledWith({
+      source: 'baseplate',
+      localPlaceFile: undefined,
+      placeId: undefined,
+      universeId: undefined,
+      placeVersion: undefined,
+    });
+  });
+
+  test('manage_instance close accepts an explicit connected unmanaged instance', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance({
+      ...READY,
+      instanceId: 'anon:external',
+      placeName: 'ExternalPlace',
+      dataModelName: 'ExternalPlace',
+    });
+    bridge.registerInstance({
+      ...READY,
+      pluginSessionId: 'session-server',
+      instanceId: 'anon:external',
+      role: 'server',
+      placeName: 'ExternalPlace',
+      dataModelName: 'ExternalPlace',
+      isRunning: true,
+    });
+    const closeConnectedInstance = jest.fn();
+    const unregisterInstanceIdEverywhere = jest.spyOn(bridge, 'unregisterInstanceIdEverywhere');
+    (tools as any).instanceManager = {
+      closeByInstanceId: () => ({ status: 'not_found' }),
+      closeConnectedInstance,
+    };
+
+    const result = await tools.manageInstance({
+      action: 'close',
+      instance_id: 'anon:external',
+    });
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      instance_id: 'anon:external',
+      message: 'Studio instance closed.',
+    });
+    expect(closeConnectedInstance).toHaveBeenCalledWith(expect.objectContaining({
+      instanceId: 'anon:external',
+      role: 'edit',
+      dataModelName: 'ExternalPlace',
+    }));
+    expect(unregisterInstanceIdEverywhere).toHaveBeenCalledWith('anon:external');
+    expect(bridge.getPublicInstances()).toEqual([]);
+  });
+
+  test('manage_instance close recovers a managed baseplate from the shared registry', async () => {
+    const registryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robloxstudio-mcp-registry-'));
+    const baseplateDir = path.join(os.tmpdir(), 'robloxstudio-mcp-baseplates');
+    const placeFile = path.join(baseplateDir, 'Baseplate-123-456.rbxl');
+    fs.mkdirSync(baseplateDir, { recursive: true });
+    fs.writeFileSync(placeFile, '<roblox />', 'utf8');
+    fs.writeFileSync(`${placeFile}.lock`, '', 'utf8');
+
+    const liveProcessIds = new Set([4321]);
+    let listCalls = 0;
+    const stopped: number[] = [];
+    const processAdapter = {
+      currentBootId: () => 'boot-1',
+      resolveStudioExe: () => 'RobloxStudioBeta.exe',
+      spawnStudio: () => ({ pid: 4321, unref: () => {} }),
+      listStudioProcesses: () => {
+        listCalls += 1;
+        if (listCalls === 1) return [];
+        return [...liveProcessIds].map((Id) => ({
+          Id,
+          Path: 'RobloxStudioBeta.exe',
+          MainWindowTitle: '',
+        }));
+      },
+      stopProcess: (processId: number) => {
+        stopped.push(processId);
+        liveProcessIds.delete(processId);
+      },
+    };
+
+    try {
+      const launcher = new StudioInstanceManager({ registryDir, processAdapter });
+      const record = await launcher.launch({ source: 'baseplate', localPlaceFile: placeFile });
+      launcher.attachInstanceId(record, 'anon:shared-baseplate');
+
+      const bridge = new BridgeService();
+      const tools = new RobloxStudioTools(bridge);
+      (tools as any).instanceManager = new StudioInstanceManager({ registryDir, processAdapter });
+
+      const result = await tools.manageInstance({
+        action: 'close',
+        instance_id: 'anon:shared-baseplate',
+      });
+
+      const body = JSON.parse(result.content[0].text);
+      expect(body).toEqual({
+        instance_id: 'anon:shared-baseplate',
+        message: 'Studio instance closed.',
+      });
+      expect(stopped).toEqual([4321]);
+      expect(fs.existsSync(placeFile)).toBe(false);
+      expect(fs.existsSync(`${placeFile}.lock`)).toBe(false);
+    } finally {
+      fs.rmSync(placeFile, { force: true });
+      fs.rmSync(`${placeFile}.lock`, { force: true });
+      fs.rmSync(registryDir, { recursive: true, force: true });
+    }
+  });
+
+  test('manage_instance close prunes previous-boot registry records without stopping recycled pids', async () => {
+    const registryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robloxstudio-mcp-registry-'));
+    const baseplateDir = path.join(os.tmpdir(), 'robloxstudio-mcp-baseplates');
+    const placeFile = path.join(baseplateDir, 'Baseplate-124-456.rbxl');
+    fs.mkdirSync(baseplateDir, { recursive: true });
+    fs.writeFileSync(placeFile, '<roblox />', 'utf8');
+
+    const stopped: number[] = [];
+    let listCalls = 0;
+    const launchAdapter = {
+      currentBootId: () => 'boot-1',
+      resolveStudioExe: () => 'RobloxStudioBeta.exe',
+      spawnStudio: () => ({ pid: 4322, unref: () => {} }),
+      listStudioProcesses: () => {
+        listCalls += 1;
+        if (listCalls === 1) return [];
+        return [{ Id: 4322, Path: 'RobloxStudioBeta.exe', MainWindowTitle: '' }];
+      },
+      stopProcess: (processId: number) => {
+        stopped.push(processId);
+      },
+    };
+    const closeAdapter = {
+      ...launchAdapter,
+      currentBootId: () => 'boot-2',
+    };
+
+    try {
+      const launcher = new StudioInstanceManager({ registryDir, processAdapter: launchAdapter });
+      const record = await launcher.launch({ source: 'baseplate', localPlaceFile: placeFile });
+      launcher.attachInstanceId(record, 'anon:previous-boot');
+
+      const bridge = new BridgeService();
+      const tools = new RobloxStudioTools(bridge);
+      (tools as any).instanceManager = new StudioInstanceManager({ registryDir, processAdapter: closeAdapter });
+
+      const result = await tools.manageInstance({
+        action: 'close',
+        instance_id: 'anon:previous-boot',
+      });
+
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        instance_id: 'anon:previous-boot',
+        message: 'Studio instance was already closed.',
+      });
+      expect(stopped).toEqual([]);
+      expect(fs.existsSync(placeFile)).toBe(false);
+      expect(readRegistryEvents(registryDir)).toContainEqual(expect.objectContaining({
+        event: 'registry_pruned_previous_boot',
+        instanceId: 'anon:previous-boot',
+      }));
+    } finally {
+      fs.rmSync(placeFile, { force: true });
+      fs.rmSync(registryDir, { recursive: true, force: true });
+    }
+  });
+
+  test('manage_instance close returns success when another process already stopped the managed instance', async () => {
+    const registryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robloxstudio-mcp-registry-'));
+    const baseplateDir = path.join(os.tmpdir(), 'robloxstudio-mcp-baseplates');
+    const placeFile = path.join(baseplateDir, 'Baseplate-125-456.rbxl');
+    fs.mkdirSync(baseplateDir, { recursive: true });
+    fs.writeFileSync(placeFile, '<roblox />', 'utf8');
+
+    const liveProcessIds = new Set([4323]);
+    const stopped: number[] = [];
+    let listCalls = 0;
+    const processAdapter = {
+      currentBootId: () => 'boot-1',
+      resolveStudioExe: () => 'RobloxStudioBeta.exe',
+      spawnStudio: () => ({ pid: 4323, unref: () => {} }),
+      listStudioProcesses: () => {
+        listCalls += 1;
+        if (listCalls === 1) return [];
+        return [...liveProcessIds].map((Id) => ({ Id, Path: 'RobloxStudioBeta.exe', MainWindowTitle: '' }));
+      },
+      stopProcess: (processId: number) => {
+        stopped.push(processId);
+        liveProcessIds.delete(processId);
+      },
+    };
+
+    try {
+      const launcher = new StudioInstanceManager({ registryDir, processAdapter });
+      const record = await launcher.launch({ source: 'baseplate', localPlaceFile: placeFile });
+      launcher.attachInstanceId(record, 'anon:double-close');
+
+      const bridge = new BridgeService();
+      const tools = new RobloxStudioTools(bridge);
+      (tools as any).instanceManager = new StudioInstanceManager({ registryDir, processAdapter });
+
+      const first = await tools.manageInstance({ action: 'close', instance_id: 'anon:double-close' });
+      expect(JSON.parse(first.content[0].text)).toEqual({
+        instance_id: 'anon:double-close',
+        message: 'Studio instance closed.',
+      });
+
+      const second = await tools.manageInstance({ action: 'close', instance_id: 'anon:double-close' });
+      expect(JSON.parse(second.content[0].text)).toEqual({
+        instance_id: 'anon:double-close',
+        message: 'Studio instance was already closed.',
+      });
+      expect(stopped).toEqual([4323]);
+      expect(readRegistryEvents(registryDir)).toContainEqual(expect.objectContaining({
+        event: 'registry_close_already_stopped',
+        instanceId: 'anon:double-close',
+      }));
+    } finally {
+      fs.rmSync(placeFile, { force: true });
+      fs.rmSync(registryDir, { recursive: true, force: true });
+    }
+  });
+
+  test('manage_instance close returns a compact error for an unclosable connected unmanaged instance', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance({
+      ...READY,
+      instanceId: 'anon:external',
+      placeName: 'ExternalPlace',
+      dataModelName: 'ExternalPlace',
+    });
+    (tools as any).instanceManager = {
+      closeByInstanceId: () => ({ status: 'not_found' }),
+      closeConnectedInstance: () => {
+        throw new Error('Could not find a Studio process for connected instance "anon:external".');
+      },
+    };
+
+    const result = await tools.manageInstance({
+      action: 'close',
+      instance_id: 'anon:external',
+    });
+
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      error: 'Could not find a Studio process for connected instance "anon:external".',
+      instance_id: 'anon:external',
+    });
+    expect(bridge.getPublicInstances()).toHaveLength(1);
+  });
+
+  test('manage_instance status self-heals malformed and closed registry records with old event logs', async () => {
+    const registryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robloxstudio-mcp-registry-'));
+    const today = new Date().toISOString().slice(0, 10);
+    fs.writeFileSync(path.join(registryDir, 'malformed.json'), '{not-json', 'utf8');
+    fs.writeFileSync(path.join(registryDir, 'closed-record.json'), JSON.stringify({
+      version: 1,
+      recordId: 'closed-record',
+      instanceId: 'anon:closed',
+      source: 'baseplate',
+      exe: 'RobloxStudioBeta.exe',
+      args: [],
+      launchedAt: Date.now(),
+      closedAt: Date.now(),
+      ownerPid: process.pid,
+      bootId: 'boot-1',
+    }), 'utf8');
+    fs.writeFileSync(path.join(registryDir, 'events-2000-01-01.jsonl'), '{}\n', 'utf8');
+    fs.writeFileSync(path.join(registryDir, `events-${today}.jsonl`), '{}\n', 'utf8');
+
+    try {
+      const bridge = new BridgeService();
+      const tools = new RobloxStudioTools(bridge);
+      (tools as any).instanceManager = new StudioInstanceManager({
+        registryDir,
+        processAdapter: {
+          currentBootId: () => 'boot-1',
+          listStudioProcesses: () => [],
+        },
+      });
+
+      const result = await tools.manageInstance({ action: 'status' });
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        managed: [],
+        connected: [],
+      });
+
+      expect(fs.existsSync(path.join(registryDir, 'malformed.json'))).toBe(false);
+      expect(fs.existsSync(path.join(registryDir, 'closed-record.json'))).toBe(false);
+      expect(fs.existsSync(path.join(registryDir, 'events-2000-01-01.jsonl'))).toBe(false);
+      expect(fs.existsSync(path.join(registryDir, `events-${today}.jsonl`))).toBe(true);
+      expect(readRegistryEvents(registryDir)).toContainEqual(expect.objectContaining({
+        event: 'registry_pruned_malformed_record',
+      }));
+    } finally {
+      fs.rmSync(registryDir, { recursive: true, force: true });
+    }
+  });
+
+  test('manage_instance status self-heals same-boot records whose Studio process exited', async () => {
+    const registryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robloxstudio-mcp-registry-'));
+    const baseplateDir = path.join(os.tmpdir(), 'robloxstudio-mcp-baseplates');
+    const placeFile = path.join(baseplateDir, 'Baseplate-126-456.rbxl');
+    fs.mkdirSync(baseplateDir, { recursive: true });
+    fs.writeFileSync(placeFile, '<roblox />', 'utf8');
+
+    const liveProcessIds = new Set([4324]);
+    let listCalls = 0;
+    const processAdapter = {
+      currentBootId: () => 'boot-1',
+      resolveStudioExe: () => 'RobloxStudioBeta.exe',
+      spawnStudio: () => ({ pid: 4324, unref: () => {} }),
+      listStudioProcesses: () => {
+        listCalls += 1;
+        if (listCalls === 1) return [];
+        return [...liveProcessIds].map((Id) => ({ Id, Path: 'RobloxStudioBeta.exe', MainWindowTitle: '' }));
+      },
+      stopProcess: () => {
+        throw new Error('status should not stop processes');
+      },
+    };
+
+    try {
+      const launcher = new StudioInstanceManager({ registryDir, processAdapter });
+      const record = await launcher.launch({ source: 'baseplate', localPlaceFile: placeFile });
+      launcher.attachInstanceId(record, 'anon:stale-process');
+      liveProcessIds.clear();
+
+      const bridge = new BridgeService();
+      const tools = new RobloxStudioTools(bridge);
+      (tools as any).instanceManager = new StudioInstanceManager({ registryDir, processAdapter });
+
+      const result = await tools.manageInstance({ action: 'status' });
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        managed: [],
+        connected: [],
+      });
+      expect(fs.existsSync(placeFile)).toBe(false);
+      expect(readRegistryEvents(registryDir)).toContainEqual(expect.objectContaining({
+        event: 'registry_pruned_stale_process',
+        instanceId: 'anon:stale-process',
+      }));
+    } finally {
+      fs.rmSync(placeFile, { force: true });
+      fs.rmSync(registryDir, { recursive: true, force: true });
+    }
+  });
+
+  test('manage_instance list_place_versions normalizes Open Cloud asset version rows', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    const listAssetVersions = jest.fn(async () => ({
+      assetVersions: [
+        {
+          path: 'assets/123/versions/3135',
+          createTime: '2026-06-25T15:03:29.611780400Z',
+          moderationResult: { moderationState: 'Approved' },
+        },
+      ],
+      nextPageToken: 'next',
+    }));
+    (tools as any).openCloudClient = {
+      hasApiKey: () => true,
+      listAssetVersions,
+    };
+
+    const result = await tools.manageInstance({
+      action: 'list_place_versions',
+      place_id: 123,
+      max_page_size: 100,
+      page_token: 'cursor',
+    });
+
+    expect(listAssetVersions).toHaveBeenCalledWith(123, 50, 'cursor');
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      versions: [{
+        version: 3135,
+        created_at: '2026-06-25T15:03:29.611780400Z',
+        path: 'assets/123/versions/3135',
+        moderation_state: 'Approved',
+      }],
+      next_page_token: 'next',
+    });
+
+    await tools.manageInstance({
+      action: 'list_place_versions',
+      place_id: 123,
+      max_page_size: 0,
+    });
+    expect(listAssetVersions).toHaveBeenLastCalledWith(123, 1, undefined);
+
+    await tools.manageInstance({
+      action: 'list_place_versions',
+      place_id: 123,
+      max_page_size: -10,
+    });
+    expect(listAssetVersions).toHaveBeenLastCalledWith(123, 1, undefined);
+
+    await expect(tools.manageInstance({
+      action: 'list_place_versions',
+      place_id: 123,
+      max_page_size: 'bad',
+    })).rejects.toThrow('max_page_size must be a finite number.');
+  });
+
+  test('studio launch args use the documented place revision task with derived universe id', () => {
+    expect(buildStudioLaunchArgs({
+      source: 'place_revision',
+      placeId: 123,
+      universeId: 456,
+      placeVersion: 7,
+    })).toEqual([
+      '--task', 'EditPlaceRevision',
+      '--placeId', '123',
+      '--universeId', '456',
+      '--placeVersion', '7',
+    ]);
+  });
+
+  test('baseplate launch args open a managed copy of the bundled baseplate', () => {
+    const args = buildStudioLaunchArgs({ source: 'baseplate' });
+    const placeFile = args[3];
+    const templateFile = path.join(process.cwd(), 'assets', 'Baseplate.rbxl');
+
+    expect(args.slice(0, 3)).toEqual(['--task', 'EditFile', '--localPlaceFile']);
+    expect(placeFile).toMatch(/Baseplate-\d+-\d+\.rbxl$/);
+    expect(fs.existsSync(placeFile)).toBe(true);
+    expect(fs.readFileSync(placeFile)).toEqual(fs.readFileSync(templateFile));
+
+    fs.rmSync(placeFile, { force: true });
+  });
+
+  test('baseplate cleanup removes generated temp files and Studio lock sidecars', () => {
+    const dir = path.join(os.tmpdir(), 'robloxstudio-mcp-baseplates');
+    fs.mkdirSync(dir, { recursive: true });
+    const placeFile = path.join(dir, 'Baseplate-123-456.rbxl');
+    const lockFile = `${placeFile}.lock`;
+    fs.writeFileSync(placeFile, '<roblox />', 'utf8');
+    fs.writeFileSync(lockFile, '', 'utf8');
+
+    cleanupManagedBaseplateFiles({ source: 'baseplate', localPlaceFile: placeFile });
+
+    expect(fs.existsSync(placeFile)).toBe(false);
+    expect(fs.existsSync(lockFile)).toBe(false);
+  });
+
+  test('baseplate cleanup does not remove caller-owned local place files', () => {
+    const placeFile = path.join(os.tmpdir(), 'Baseplate-user-owned.rbxlx');
+    fs.writeFileSync(placeFile, '<roblox />', 'utf8');
+
+    cleanupManagedBaseplateFiles({ source: 'local_file', localPlaceFile: placeFile });
+    cleanupManagedBaseplateFiles({ source: 'baseplate', localPlaceFile: placeFile });
+
+    expect(fs.existsSync(placeFile)).toBe(true);
+    fs.rmSync(placeFile, { force: true });
+  });
+
+  test('managed baseplate launch matching ignores unrelated existing Studio connections', () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    const matches = (tools as unknown as {
+      _matchesManagedLaunch(record: Record<string, unknown>, instance: typeof READY): boolean;
+    })._matchesManagedLaunch.bind(tools);
+    const localPlaceFile = path.join(os.tmpdir(), 'Baseplate-race-test.rbxl');
+    const record = {
+      source: 'baseplate',
+      localPlaceFile,
+      launchedAt: Date.now(),
+    };
+
+    expect(matches(record, {
+      ...READY,
+      instanceId: 'place:90999018355158',
+      placeId: 90999018355158,
+      placeName: 'STRAIN',
+      dataModelName: 'STRAIN',
+    })).toBe(false);
+    expect(matches(record, {
+      ...READY,
+      instanceId: 'anon:test',
+      placeId: 0,
+      placeName: 'Baseplate-race-test.rbxl',
+      dataModelName: 'Baseplate-race-test.rbxl',
+    })).toBe(true);
+  });
+
+  test('client broker forwards script profiler captures to client peers', () => {
+    const cwd = process.cwd();
+    const repoRoot = fs.existsSync(path.join(cwd, 'studio-plugin')) ? cwd : path.resolve(cwd, '../..');
+    const source = fs.readFileSync(path.join(repoRoot, 'studio-plugin/src/modules/ClientBroker.ts'), 'utf8');
+    expect(source).toContain('"/api/capture-script-profiler"');
+    expect(source).toContain('payload.endpoint === "/api/capture-script-profiler"');
+    expect(source).toContain('"/api/capture-micro-profiler"');
+    expect(source).toContain('payload.endpoint === "/api/capture-micro-profiler"');
+  });
+
+  test('breakpoints decorates response with resolved target role', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'Game',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.breakpoints('set', {
+      script_path: 'game.ServerScriptService.Main',
+      line: 12,
+      log_message: '"probe"',
+    }, 'server', 'place:test');
+
+    const pending = bridge.getPendingRequest('place:test', 'server');
+    expect(pending?.request).toMatchObject({
+      endpoint: '/api/breakpoints',
+      data: {
+        action: 'set',
+        script_path: 'game.ServerScriptService.Main',
+        line: 12,
+        log_message: '"probe"',
+        __mcp_instance_id: 'place:test',
+        __mcp_target_role: 'server',
+      },
+    });
+    bridge.resolveRequest(pending!.requestId, { ok: true, breakpoint: { line: 12 } });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({ target: 'server', ok: true, breakpoint: { line: 12 } });
+  });
+
+  test('capture_script_profiler routes to one runtime peer and writes raw json to output_path', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'Game',
+      isRunning: true,
+    });
+    const outputPath = path.join(os.tmpdir(), `rsmcp-script-profiler-${Date.now()}.json`);
+
+    const resultPromise = tools.captureScriptProfiler('client-1', {
+      duration_ms: 250,
+      output_path: outputPath,
+    }, 'place:test');
+
+    const pending = bridge.getPendingRequest('place:test', 'client-1');
+    expect(pending?.request).toMatchObject({
+      endpoint: '/api/capture-script-profiler',
+      data: {
+        duration_ms: 250,
+        __mcp_include_raw_json: true,
+        __mcp_instance_id: 'place:test',
+        __mcp_target_role: 'client-1',
+      },
+    });
+    bridge.resolveRequest(pending!.requestId, {
+      ok: true,
+      raw_json: '{"Version":2}',
+      top_functions: [],
+      counts: { functions: 0, nodes: 0, categories: 0 },
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      target: 'client-1',
+      ok: true,
+      output_path: path.resolve(outputPath),
+      top_functions: [],
+      counts: { functions: 0, nodes: 0, categories: 0 },
+    });
+    expect(fs.readFileSync(outputPath, 'utf8')).toBe('{"Version":2}');
+    fs.rmSync(outputPath, { force: true });
+  });
+
+  test('capture_micro_profiler routes to one runtime peer and writes raw snapshot to output_path', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'Game',
+      isRunning: true,
+    });
+    const outputPath = path.join(os.tmpdir(), `rsmcp-micro-profiler-${Date.now()}.mp`);
+    const summaryOutputPath = path.join(os.tmpdir(), `rsmcp-micro-profiler-${Date.now()}.json`);
+
+    const resultPromise = tools.captureMicroProfiler('server', {
+      duration_ms: 250,
+      focus: 'script',
+      max_events: 10000,
+      max_groups: 10,
+      max_timers_per_group: 3,
+      summary_output_path: summaryOutputPath,
+      output_path: outputPath,
+      baseline_label: 'empty_baseplate',
+      current_label: 'game',
+      max_comparison_rows: 5,
+      baseline: {
+        duration_ms: 250,
+        top_groups: [{ group: 'Script', total_us: 100, exclusive_us: 40, count: 2 }],
+        top_timers: [{ group: 'Script', name: '$Script', total_us: 80, exclusive_us: 30, count: 2 }],
+      },
+    }, 'place:test');
+
+    const pending = bridge.getPendingRequest('place:test', 'server');
+    expect(pending?.request).toMatchObject({
+      endpoint: '/api/capture-micro-profiler',
+      data: {
+        duration_ms: 250,
+        focus: 'script',
+        max_events: 10000,
+	        max_groups: 10,
+	        max_timers_per_group: 3,
+	        __mcp_include_raw_buffer: true,
+	        __mcp_include_comparison_index: true,
+	        __mcp_instance_id: 'place:test',
+	        __mcp_target_role: 'server',
+	      },
+    });
+    bridge.resolveRequest(pending!.requestId, {
+      ok: true,
+      raw_snapshot_base64: Buffer.from('micro').toString('base64'),
+      duration_ms: 250,
+      top_timers: [{ group: 'Script', name: '$Script', total_us: 280, exclusive_us: 90, count: 3 }],
+      top_groups: [{ group: 'Script', total_us: 300, exclusive_us: 100, count: 3 }],
+      counts: { events_sampled: 0 },
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      target: 'server',
+      ok: true,
+      output_path: path.resolve(outputPath),
+      summary_output_path: path.resolve(summaryOutputPath),
+      duration_ms: 250,
+      top_timers: [{ group: 'Script', name: '$Script', total_us: 280, exclusive_us: 90, count: 3 }],
+      top_groups: [{ group: 'Script', total_us: 300, exclusive_us: 100, count: 3 }],
+      counts: { events_sampled: 0 },
+      baseline_comparison: {
+	        baseline_label: 'empty_baseplate',
+	        current_label: 'game',
+	        basis: 'inclusive_us_per_second normalized by each capture analysis duration; deltas use current minus baseline.',
+	        coverage: { current: 'returned_rows', baseline: 'returned_rows' },
+	        duration_ms: { baseline: 250, current: 250 },
+	        groups: [{
+	          group: 'Script',
+	          matched_by: 'stable_label',
+	          match_confidence: 'medium',
+	          current_inclusive_us: 300,
+	          baseline_inclusive_us: 100,
+	          delta_inclusive_us: 200,
+	          current_inclusive_us_per_s: 1200,
+	          baseline_inclusive_us_per_s: 400,
+	          delta_inclusive_us_per_s: 800,
+	          current_exclusive_us: 100,
+	          baseline_exclusive_us: 40,
+	          delta_exclusive_us: 60,
+	          current_exclusive_us_per_s: 400,
+	          baseline_exclusive_us_per_s: 160,
+	          delta_exclusive_us_per_s: 240,
+	          current_count: 3,
+	          baseline_count: 2,
+	          delta_count: 1,
+	          current_count_per_s: 12,
+	          baseline_count_per_s: 8,
+	          delta_count_per_s: 4,
+	          delta_pct: 200,
+	        }],
+	        timers: [{
+	          group: 'Script',
+	          name: '$Script',
+	          matched_by: 'stable_label',
+	          match_confidence: 'medium',
+	          current_inclusive_us: 280,
+	          baseline_inclusive_us: 80,
+	          delta_inclusive_us: 200,
+	          current_inclusive_us_per_s: 1120,
+	          baseline_inclusive_us_per_s: 320,
+	          delta_inclusive_us_per_s: 800,
+	          current_exclusive_us: 90,
+	          baseline_exclusive_us: 30,
+	          delta_exclusive_us: 60,
+	          current_exclusive_us_per_s: 360,
+	          baseline_exclusive_us_per_s: 120,
+	          delta_exclusive_us_per_s: 240,
+	          current_count: 3,
+	          baseline_count: 2,
+	          delta_count: 1,
+	          current_count_per_s: 12,
+	          baseline_count_per_s: 8,
+	          delta_count_per_s: 4,
+	          delta_pct: 250,
+	        }],
+	        threads: [],
+	        call_edges: [],
+	      },
+	    });
+    expect(fs.readFileSync(outputPath, 'utf8')).toBe('micro');
+	    const summary = JSON.parse(fs.readFileSync(summaryOutputPath, 'utf8'));
+	    expect(summary.baseline_comparison.groups[0].delta_inclusive_us_per_s).toBe(800);
+    fs.rmSync(outputPath, { force: true });
+    fs.rmSync(summaryOutputPath, { force: true });
+  });
+
+  test('generate_model routes to edit context and returns brief model path response', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.generateModel({
+      prompt: 'low-poly sci-fi crate',
+      name: 'GeneratedCrate',
+      schema: 'Body1',
+      timeout_ms: 60000,
+    }, 'place:test');
+
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending?.request).toMatchObject({
+      endpoint: '/api/generate-model',
+      data: {
+        prompt: 'low-poly sci-fi crate',
+        name: 'GeneratedCrate',
+        schema: 'Body1',
+      },
+    });
+    bridge.resolveRequest(pending!.requestId, {
+      success: true,
+      modelPath: 'game.ServerStorage.__MCPGeneratedModels.GeneratedCrate',
+    });
+
+    const result = await resultPromise;
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      success: true,
+      modelPath: 'game.ServerStorage.__MCPGeneratedModels.GeneratedCrate',
+    });
+  });
+
+  test('generate_model sends schema_groups without a conflicting default schema', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.generateModel({
+      prompt: 'low-poly vehicle',
+      name: 'SegmentedVehicle',
+      schema_groups: ['Body', 'Front Left Wheel', 'Front Right Wheel', 'Rear Left Wheel', 'Rear Right Wheel'],
+    }, 'place:test');
+
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending?.request.endpoint).toBe('/api/generate-model');
+    expect(pending?.request.data.schema_groups).toEqual([
+      'Body',
+      'Front Left Wheel',
+      'Front Right Wheel',
+      'Rear Left Wheel',
+      'Rear Right Wheel',
+    ]);
+    expect(pending?.request.data).not.toHaveProperty('schema');
+    bridge.resolveRequest(pending!.requestId, {
+      success: true,
+      modelPath: 'game.ServerStorage.__MCPGeneratedModels.SegmentedVehicle',
+    });
+
+    await resultPromise;
+  });
+
+  test('generate_model source image upload uses backing textureId instead of Decal wrapper id', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge) as any;
+    tools.cookieClient = { hasCookie: () => false };
+    tools.openCloudClient = {
+      hasApiKey: () => true,
+      createAsset: jest.fn(async () => ({
+        response: { assetId: '555', displayName: 'Studio Assistant Source Image', assetType: 'Decal' },
+      })),
+      getAssetDetails: jest.fn(async () => ({
+        asset: { id: 555, textureId: 777, name: 'Studio Assistant Source Image' },
+      })),
+    };
+    tools.resolveImageId = jest.fn(async () => {
+      throw new Error('Studio resolver should not be needed when textureId is available');
+    });
+
+    // The Open Cloud upload path requires a creator identity from the environment.
+    const prevUserId = process.env.ROBLOX_CREATOR_USER_ID;
+    const prevGroupId = process.env.ROBLOX_CREATOR_GROUP_ID;
+    process.env.ROBLOX_CREATOR_USER_ID = '123456';
+    delete process.env.ROBLOX_CREATOR_GROUP_ID;
+
+    try {
+      const imageId = await tools.uploadGenerateModelReferenceImage(Buffer.from('not actually png'), 'place:test');
+
+      expect(imageId).toBe(777);
+      expect(tools.openCloudClient.createAsset).toHaveBeenCalledWith(
+        expect.objectContaining({
+          assetType: 'Decal',
+          displayName: 'Studio Assistant Source Image',
+          description: 'Studio Assistant Source Image',
+          creationContext: { creator: { userId: '123456' } },
+        }),
+        expect.any(Buffer),
+        'generate-model-reference.png',
+      );
+      expect(tools.resolveImageId).not.toHaveBeenCalled();
+    } finally {
+      if (prevUserId === undefined) delete process.env.ROBLOX_CREATOR_USER_ID;
+      else process.env.ROBLOX_CREATOR_USER_ID = prevUserId;
+      if (prevGroupId === undefined) delete process.env.ROBLOX_CREATOR_GROUP_ID;
+      else process.env.ROBLOX_CREATOR_GROUP_ID = prevGroupId;
+    }
+  });
+
+  test('get_script_source shows plugin truncation range and note', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.getScriptSource('game.ServerScriptService.Manager', undefined, undefined, 'place:test');
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending?.request.endpoint).toBe('/api/get-script-source');
+    bridge.resolveRequest(pending!.requestId, {
+      success: true,
+      instancePath: 'game.ServerScriptService.Manager',
+      className: 'Script',
+      topService: 'ServerScriptService',
+      lineCount: 1700,
+      startLine: 1,
+      endLine: 300,
+      truncated: true,
+      note: 'Truncated to first 300 lines; use line_range to read more.',
+      numberedSource: '1  print("start")\n300 print("still here")',
+    });
+
+    const result = await resultPromise;
+    const text = result.content[0].text;
+    expect(text).toContain('Lines:    1700 total (showing 1-300)');
+    expect(text).toContain('Note:     Truncated to first 300 lines; use line_range to read more.');
+    expect(text).not.toContain('Truncated to first 1000 lines');
+  });
+
+  test('start_playtest reports already running when runtime peers are connected', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'Game',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'Game',
+      isRunning: true,
+    });
+
+    const result = await tools.startPlaytest('play', undefined, 'place:test');
+    expect(bridge.getPendingRequest('place:test', 'edit')).toBeNull();
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: false,
+      error: 'Playtest already running.',
+      message: 'A playtest is already running for this Studio place. Stop the current playtest before starting another.',
+      runtimeReady: true,
+      timedOut: false,
+      roles: ['edit', 'server', 'client-1'],
+      runtimeRoles: ['server', 'client-1'],
+    });
+  });
+
+  test('start_playtest play mode waits for fresh server and client peers', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.startPlaytest('play');
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending).toBeTruthy();
+    bridge.resolveRequest(pending!.requestId, { success: true, message: 'started' });
+
+    let settled = false;
+    void resultPromise.then(() => {
+      settled = true;
+    }, () => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: true,
+      runtimeReady: true,
+      timedOut: false,
+    });
+    expect(body.roles).toContain('server');
+    expect(body.roles).toContain('client-1');
+  });
+
+  test('start_playtest run mode waits only for a fresh server peer', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.startPlaytest('run');
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending).toBeTruthy();
+    bridge.resolveRequest(pending!.requestId, { success: true, message: 'started' });
+
+    let settled = false;
+    void resultPromise.then(() => {
+      settled = true;
+    }, () => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: true,
+      runtimeReady: true,
+      timedOut: false,
+    });
+    expect(body.roles).toContain('server');
+    expect(body.roles).not.toContain('client-1');
+  });
+
+  test('stop_playtest waits for runtime peers to disconnect', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.stopPlaytest();
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending).toBeTruthy();
+    bridge.resolveRequest(pending!.requestId, { success: true, message: 'stopping' });
+
+    let settled = false;
+    void resultPromise.then(() => {
+      settled = true;
+    }, () => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    bridge.unregisterInstance('server-1');
+    bridge.unregisterInstance('client-1');
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: true,
+      runtimeStopped: true,
+      timedOut: false,
+    });
+    expect(body.roles).toEqual(['edit']);
+  });
+
+  test('stop_playtest reports stuck teardown when runtime peers do not disconnect', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    (tools as any)._waitForRuntimeRoles = async () => ({
+      ok: false,
+      roles: ['edit', 'server', 'client-1'],
+      timedOut: true,
+    });
+
+    const resultPromise = tools.stopPlaytest();
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending).toBeTruthy();
+    bridge.resolveRequest(pending!.requestId, { success: true, message: 'Playtest stopped.' });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: false,
+      error: 'Playtest teardown did not complete.',
+      runtimeStopped: false,
+      timedOut: true,
+      stopSignalAccepted: true,
+      roles: ['edit', 'server', 'client-1'],
+      runtimeRoles: ['server', 'client-1'],
+    });
+    expect(body.message).toContain('did not disconnect');
+    expect(body.possibleCause).toContain('BindToClose');
+    expect(body.possibleCause).toContain('No runtime hard-stop or synthetic keyboard fallback');
+    expect(body.fallbacks).toBeUndefined();
+  });
+
+  test('stop_playtest reports edit request failure when runtime peers remain', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.stopPlaytest();
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending).toBeTruthy();
+    bridge.rejectRequest(pending!.requestId, new Error('edit peer timed out'));
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: false,
+      error: 'Playtest teardown did not complete.',
+      message: 'Edit stop request failed, and runtime peers are still connected.',
+      runtimeStopped: false,
+      timedOut: false,
+      roles: ['edit', 'server'],
+      stopSignalAccepted: false,
+      runtimeRoles: ['server'],
+    });
+    expect(body.detail).toContain('edit peer timed out');
+    expect(body.stopRequestError).toContain('edit peer timed out');
+    expect(body.fallbacks).toBeUndefined();
+  });
+
+  test('stop_playtest accepts stale anon id after publish and waits for runtime peers', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance({
+      ...READY,
+      pluginSessionId: 'edit-stale',
+      instanceId: 'anon:old-file-id',
+      placeId: 0,
+    });
+    bridge.updateInstanceMetadata('edit-stale', { placeId: 12345 });
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:12345',
+      role: 'server',
+      placeId: 12345,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:12345',
+      role: 'client',
+      placeId: 12345,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.stopPlaytest('anon:old-file-id');
+    const pending = bridge.getPendingRequest('place:12345', 'edit');
+    expect(pending).toBeTruthy();
+    bridge.resolveRequest(pending!.requestId, { success: true, message: 'stopping' });
+
+    let settled = false;
+    void resultPromise.then(() => {
+      settled = true;
+    }, () => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    bridge.unregisterInstance('server-1');
+    bridge.unregisterInstance('client-1');
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: true,
+      runtimeStopped: true,
+      timedOut: false,
+    });
+    expect(body.roles).toEqual(['edit']);
+  });
+
+  test('solo_playtest start returns a brief ready response', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.soloPlaytest('start', 'run', 1);
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending).toBeTruthy();
+    bridge.resolveRequest(pending!.requestId, { success: true, message: 'started' });
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      success: true,
+      action: 'start',
+      message: 'Playtest started.',
+      roles: ['edit', 'server'],
+    });
+  });
+
+  test('solo_playtest stop returns a brief stopped response', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.soloPlaytest('stop', undefined, 1);
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending).toBeTruthy();
+    bridge.resolveRequest(pending!.requestId, { success: true, message: 'stopping' });
+    bridge.unregisterInstance('server-1');
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      success: true,
+      action: 'stop',
+      message: 'Playtest stopped.',
+    });
+  });
+
+  test('multiplayer_playtest status returns a brief state summary', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    (tools as any)._buildMultiplayerState = async () => ({
+      phase: 'running',
+      peers: [{ role: 'edit' }, { role: 'server' }, { role: 'client-1' }],
+      clientRoles: ['client-1'],
+      playerCount: 1,
+      testArgs: { noisy: true },
+    });
+
+    const result = await tools.multiplayerPlaytest('status', undefined, undefined, undefined, undefined, undefined, 'place:test');
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      success: true,
+      action: 'status',
+      phase: 'running',
+      roles: ['edit', 'server', 'client-1'],
+      clientRoles: ['client-1'],
+      playerCount: 1,
+    });
+  });
+
+  test('multiplayer_playtest start requires force before launching hazardous StudioTestService sessions', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const result = await tools.multiplayerPlaytest('start', 1, undefined, undefined, undefined, 1, 'place:test');
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body).toMatchObject({
+      success: false,
+      action: 'start',
+      error: 'multiplayer_force_required',
+      requiresForce: true,
+      manualCleanupRequired: true,
+    });
+    expect(bridge.getPendingRequest('place:test', 'edit')).toBeNull();
+  });
+
+  test('multiplayer_playtest forced start waits for detected server and client peers', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge) as any;
+    tools._buildMultiplayerState = async () => ({
+      peers: [{ role: 'edit' }, { role: 'server' }, { role: 'client-1' }],
+      clientRoles: ['client-1'],
+      playerCount: 1,
+    });
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.multiplayerPlaytest('start', 1, undefined, undefined, undefined, 2, 'place:test', true);
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending?.request).toMatchObject({
+      endpoint: '/api/multiplayer-test-start',
+      data: { numPlayers: 1, testArgs: {} },
+    });
+    bridge.resolveRequest(pending!.requestId, {
+      success: true,
+      message: 'Multiplayer Studio test starting with 1 player(s).',
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'Game',
+      dataModelName: 'Game',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'Game',
+      dataModelName: 'Game',
+      isRunning: true,
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: true,
+      action: 'start',
+      ready: true,
+      manualCleanupRequired: true,
+      roles: expect.arrayContaining(['edit', 'server', 'client-1']),
+    });
+  });
+
+  test('multiplayer start reports failure when peers are not detected before timeout', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge) as any;
+    tools._buildMultiplayerState = async () => ({
+      peers: [{ role: 'edit' }],
+      clientRoles: [],
+      playerCount: 0,
+    });
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.multiplayerPlaytest('start', 1, undefined, undefined, undefined, 0.1, 'place:test', true);
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    bridge.resolveRequest(pending!.requestId, {
+      success: true,
+      message: 'Multiplayer Studio test starting with 1 player(s).',
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: false,
+      action: 'start',
+      error: 'multiplayer_start_not_detected',
+      manualCleanupRequired: true,
+    });
+  });
+
+  test('multiplayer stop/end is disabled and does not call EndTest', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'Game',
+      dataModelName: 'Game',
+      isRunning: true,
+    });
+
+    const wrapperResult = await tools.multiplayerPlaytest('end', undefined, undefined, undefined, 'done', 1, 'place:test');
+    const wrapperBody = JSON.parse(wrapperResult.content[0].text);
+    expect(wrapperBody).toMatchObject({
+      success: false,
+      action: 'end',
+      error: 'multiplayer_stop_disabled',
+      manualCleanupRequired: true,
+    });
+
+    const rawResult = await tools.multiplayerTestEnd('done', 1, 'place:test');
+    const rawBody = JSON.parse(rawResult.content[0].text);
+    expect(rawBody).toMatchObject({
+      success: false,
+      error: 'multiplayer_stop_disabled',
+      manualCleanupRequired: true,
+    });
+    expect(bridge.getPendingRequest('place:test', 'server')).toBeNull();
+  });
+
+  test('multiplayer start keeps waiting when edit phase completes before peers register', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge) as any;
+    const exactChecks = jest.fn()
+      .mockResolvedValueOnce({ ok: false, roles: ['edit'], timedOut: true })
+      .mockResolvedValueOnce({ ok: true, roles: ['edit', 'server', 'client-1'], timedOut: false });
+    tools._waitForExactClientCount = exactChecks;
+    tools.client = {
+      request: jest.fn(async () => ({
+        session: { phase: 'completed' },
+      })),
+    };
+
+    const result = await tools._waitForMultiplayerStart('place:test', 1, 1);
+
+    expect(result).toEqual({
+      ok: true,
+      roles: ['edit', 'server', 'client-1'],
+      timedOut: false,
+      error: undefined,
+    });
+    expect(exactChecks).toHaveBeenCalledTimes(2);
+  });
+
+  test('get_scene_analysis fans out to connected peers', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.getSceneAnalysis('script_memory', 'all', 5, false, 'place:test');
+    const editPending = bridge.getPendingRequest('place:test', 'edit');
+    const serverPending = bridge.getPendingRequest('place:test', 'server');
+    expect(editPending?.request).toMatchObject({
+      endpoint: '/api/get-scene-analysis',
+      data: { mode: 'script_memory', topN: 5, raw: false },
+    });
+    expect(serverPending?.request).toMatchObject({
+      endpoint: '/api/get-scene-analysis',
+      data: { mode: 'script_memory', topN: 5, raw: false },
+    });
+
+    bridge.resolveRequest(editPending!.requestId, { mode: 'script_memory', peer: 'edit' });
+    bridge.resolveRequest(serverPending!.requestId, { mode: 'script_memory', peer: 'server' });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toEqual({
+      edit: { mode: 'script_memory', peer: 'edit' },
+      server: { mode: 'script_memory', peer: 'server' },
+    });
+  });
+
+  test('set_network_profile fans out to connected clients only', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-2',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.setNetworkProfile('good', 'all-clients', undefined, 'place:test');
+    const editPending = bridge.getPendingRequest('place:test', 'edit');
+    const serverPending = bridge.getPendingRequest('place:test', 'server');
+    const client1Pending = bridge.getPendingRequest('place:test', 'client-1');
+    const client2Pending = bridge.getPendingRequest('place:test', 'client-2');
+
+    expect(editPending).toBeNull();
+    expect(serverPending).toBeNull();
+    expect(client1Pending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(client2Pending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(client1Pending?.request.data.code).toContain('NetworkSettings');
+    expect(client1Pending?.request.data.code).toContain('InboundNetworkMinDelayMs');
+    expect(client1Pending?.request.data.code).toContain('50');
+    expect(client1Pending?.request.data.code).toContain('10');
+
+    bridge.resolveRequest(client1Pending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        profile: 'good',
+        applied: { InboundNetworkMinDelayMs: 50 },
+        after: { InboundNetworkMinDelayMs: 50 },
+      }),
+    });
+    bridge.resolveRequest(client2Pending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        profile: 'good',
+        applied: { InboundNetworkMinDelayMs: 50 },
+        after: { InboundNetworkMinDelayMs: 50 },
+      }),
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      profile: 'good',
+      target: 'all-clients',
+      applied: {
+        InboundNetworkMinDelayMs: 50,
+        OutboundNetworkMinDelayMs: 50,
+        InboundNetworkJitterMs: 10,
+        OutboundNetworkJitterMs: 10,
+        InboundNetworkLossPercent: 0,
+        OutboundNetworkLossPercent: 0,
+      },
+      targets: {
+        'client-1': { profile: 'good', after: { InboundNetworkMinDelayMs: 50 } },
+        'client-2': { profile: 'good', after: { InboundNetworkMinDelayMs: 50 } },
+      },
+    });
+  });
+
+  test('set_network_profile rejects non-client targets', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    await expect(tools.setNetworkProfile('good', 'server', undefined, 'place:test')).rejects.toThrow(/client-N|all-clients/);
+  });
+
+  test('set_network_profile rejects the tool call when any fanout target fails', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-2',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.setNetworkProfile('good', 'all-clients', undefined, 'place:test');
+    const client1Pending = bridge.getPendingRequest('place:test', 'client-1');
+    const client2Pending = bridge.getPendingRequest('place:test', 'client-2');
+    bridge.resolveRequest(client1Pending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        profile: 'good',
+        applied: { InboundNetworkMinDelayMs: 50 },
+        after: { InboundNetworkMinDelayMs: 50 },
+      }),
+    });
+    bridge.rejectRequest(client2Pending!.requestId, new Error('client-2 disconnected'));
+
+    await expect(resultPromise).rejects.toThrow(/set_network_profile failed.*client-2.*disconnected/);
+  });
+
+  test('set_network_profile rejects packet loss above Roblox engine limit', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+
+    await expect(tools.setNetworkProfile('custom', 'client-1', {
+      InboundNetworkLossPercent: 0.5001,
+    })).rejects.toThrow(/Roblox engine limits packet loss simulation to 0\.5%/);
+
+    await expect(tools.setNetworkProfile('custom', 'client-1', {
+      OutboundNetworkLossPercent: 1,
+    })).rejects.toThrow(/Roblox engine limits packet loss simulation to 0\.5%/);
+  });
+
+  test('set_network_profile rejects negative network overrides', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+
+    await expect(tools.setNetworkProfile('custom', 'client-1', {
+      InboundNetworkMinDelayMs: -1,
+    })).rejects.toThrow(/InboundNetworkMinDelayMs.*greater than or equal to 0/);
+
+    await expect(tools.setNetworkProfile('custom', 'client-1', {
+      OutboundNetworkJitterMs: -0.1,
+    })).rejects.toThrow(/OutboundNetworkJitterMs.*greater than or equal to 0/);
+
+    await expect(tools.setNetworkProfile('custom', 'client-1', {
+      InboundNetworkLossPercent: -0.1,
+    })).rejects.toThrow(/InboundNetworkLossPercent.*greater than or equal to 0/);
+  });
+
+  test('set_network_profile allows packet loss at Roblox engine limit', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.setNetworkProfile('custom', 'client-1', {
+      InboundNetworkLossPercent: 0.5,
+    }, 'place:test');
+    const pending = bridge.getPendingRequest('place:test', 'client-1');
+    expect(pending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(pending?.request.data.code).toContain('\\"InboundNetworkLossPercent\\":0.5');
+    bridge.resolveRequest(pending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        profile: 'custom',
+        applied: { InboundNetworkLossPercent: 0.5 },
+        after: { InboundNetworkLossPercent: 0.5 },
+      }),
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body.targets['client-1']).toMatchObject({
+      applied: { InboundNetworkLossPercent: 0.5 },
+      after: { InboundNetworkLossPercent: 0.5 },
+    });
+  });
+
+  test('get_simulation_state reads edit and connected clients while skipping server', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.getSimulationState('both', 'edit-and-clients', 'place:test');
+    const editNetworkPending = bridge.getPendingRequest('place:test', 'edit');
+    const clientNetworkPending = bridge.getPendingRequest('place:test', 'client-1');
+    const serverPending = bridge.getPendingRequest('place:test', 'server');
+    expect(serverPending).toBeNull();
+    expect(editNetworkPending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(clientNetworkPending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(editNetworkPending?.request.data.code).toContain('NetworkSettings');
+    expect(clientNetworkPending?.request.data.code).toContain('NetworkSettings');
+
+    bridge.resolveRequest(editNetworkPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ success: true, state: ZERO_NETWORK_STATE }),
+    });
+    bridge.resolveRequest(clientNetworkPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ success: true, state: DIRTY_NETWORK_STATE }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const editDevicePending = bridge.getPendingRequest('place:test', 'edit');
+    const clientDevicePending = bridge.getPendingRequest('place:test', 'client-1');
+    expect(editDevicePending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(clientDevicePending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(editDevicePending?.request.data.code).toContain('StudioDeviceSimulatorService');
+    expect(clientDevicePending?.request.data.code).toContain('StudioDeviceSimulatorService');
+
+    bridge.resolveRequest(editDevicePending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ activeDeviceId: 'default', isSimulating: false }),
+    });
+    bridge.resolveRequest(clientDevicePending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ activeDeviceId: 'iphone_XR', isSimulating: true, orientation: 'LandscapeRight' }),
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      include: 'both',
+      target: 'edit-and-clients',
+      roles: {
+        edit: {
+          network: { success: true, state: ZERO_NETWORK_STATE },
+          deviceSimulator: { activeDeviceId: 'default', isSimulating: false },
+        },
+        'client-1': {
+          network: { success: true, state: DIRTY_NETWORK_STATE },
+          deviceSimulator: { activeDeviceId: 'iphone_XR', isSimulating: true },
+        },
+      },
+      warnings: [],
+    });
+    expect(body.roles.server).toBeUndefined();
+    expect(body.persistenceNotes).toEqual(expect.arrayContaining([
+      expect.stringContaining('Normal Play'),
+      expect.stringContaining('StudioTestService'),
+    ]));
+  });
+
+  test('get_simulation_state respects network-only and device-only includes', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const networkOnlyPromise = tools.getSimulationState('network', 'edit', 'place:test');
+    const networkPending = bridge.getPendingRequest('place:test', 'edit');
+    expect(networkPending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(networkPending?.request.data.code).toContain('NetworkSettings');
+    expect(networkPending?.request.data.code).not.toContain('StudioDeviceSimulatorService');
+    bridge.resolveRequest(networkPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ success: true, state: ZERO_NETWORK_STATE }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(bridge.getPendingRequest('place:test', 'edit')).toBeNull();
+    const networkOnly = JSON.parse((await networkOnlyPromise).content[0].text);
+    expect(networkOnly).toMatchObject({
+      include: 'network',
+      roles: { edit: { network: { state: ZERO_NETWORK_STATE } } },
+    });
+    expect(networkOnly.roles.edit.deviceSimulator).toBeUndefined();
+
+    const deviceOnlyPromise = tools.getSimulationState('deviceSimulator', 'edit', 'place:test');
+    const devicePending = bridge.getPendingRequest('place:test', 'edit');
+    expect(devicePending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(devicePending?.request.data.code).toContain('StudioDeviceSimulatorService');
+    expect(devicePending?.request.data.code).not.toContain('NetworkSettings');
+    bridge.resolveRequest(devicePending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ activeDeviceId: 'default', isSimulating: false }),
+    });
+
+    const deviceOnly = JSON.parse((await deviceOnlyPromise).content[0].text);
+    expect(deviceOnly).toMatchObject({
+      include: 'deviceSimulator',
+      roles: { edit: { deviceSimulator: { activeDeviceId: 'default', isSimulating: false } } },
+    });
+    expect(deviceOnly.roles.edit.network).toBeUndefined();
+  });
+
+  test('reset_simulation_state resets network and device state for edit and clients only', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.resetSimulationState(undefined, undefined, undefined, 'place:test');
+    const editNetworkPending = bridge.getPendingRequest('place:test', 'edit');
+    const clientNetworkPending = bridge.getPendingRequest('place:test', 'client-1');
+    const serverPending = bridge.getPendingRequest('place:test', 'server');
+    expect(serverPending).toBeNull();
+    expect(editNetworkPending?.request.data.code).toContain('NetworkSettings');
+    expect(editNetworkPending?.request.data.code).toContain('ns[key] = value');
+    expect(clientNetworkPending?.request.data.code).toContain('NetworkSettings');
+    expect(clientNetworkPending?.request.data.code).toContain('ns[key] = value');
+
+    bridge.resolveRequest(editNetworkPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ success: true, applied: ZERO_NETWORK_STATE, before: DIRTY_NETWORK_STATE, after: ZERO_NETWORK_STATE }),
+    });
+    bridge.resolveRequest(clientNetworkPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ success: true, applied: ZERO_NETWORK_STATE, before: DIRTY_NETWORK_STATE, after: ZERO_NETWORK_STATE }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const editDevicePending = bridge.getPendingRequest('place:test', 'edit');
+    const clientDevicePending = bridge.getPendingRequest('place:test', 'client-1');
+    expect(editDevicePending?.request.data.code).toContain('StopSimulationAsync');
+    expect(clientDevicePending?.request.data.code).toContain('StopSimulationAsync');
+
+    bridge.resolveRequest(editDevicePending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        success: true,
+        applied: { stopSimulation: true },
+        before: { activeDeviceId: 'iphone_XR', isSimulating: true },
+        after: { activeDeviceId: 'default', isSimulating: false },
+      }),
+    });
+    bridge.resolveRequest(clientDevicePending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        success: true,
+        applied: { stopSimulation: true },
+        before: { activeDeviceId: 'iphone_XR', isSimulating: true },
+        after: { activeDeviceId: 'default', isSimulating: false },
+      }),
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: true,
+      target: 'edit-and-clients',
+      network: true,
+      deviceSimulator: true,
+      roles: {
+        edit: {
+          network: true,
+          deviceSimulator: true,
+        },
+        'client-1': {
+          network: true,
+          deviceSimulator: true,
+        },
+      },
+      warnings: [],
+    });
+    expect(body.roles.server).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('"before"');
+    expect(JSON.stringify(body)).not.toContain('"after"');
+    expect(JSON.stringify(body)).not.toContain('"applied"');
+    expect(body.persistenceNotes).toBeUndefined();
+  });
+
+  test('reset_simulation_state rejects the tool call when any reset operation fails', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.resetSimulationState('edit', true, false, 'place:test');
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    bridge.rejectRequest(pending!.requestId, new Error('network reset boom'));
+
+    await expect(resultPromise).rejects.toThrow(/reset_simulation_state failed.*edit\.network.*network reset boom/);
+  });
+
+  test('reset_simulation_state warns but does not fail when all-clients has no clients', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const result = await tools.resetSimulationState('all-clients', true, false, 'place:test');
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      success: true,
+      target: 'all-clients',
+      network: true,
+      deviceSimulator: false,
+      roles: {},
+    });
+    expect(body.warnings).toEqual([expect.stringContaining('No connected playtest client roles')]);
+    expect(bridge.getPendingRequest('place:test', 'edit')).toBeNull();
+  });
+
+  test('simulation state tools reject server target and empty reset', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    await expect(tools.getSimulationState('both', 'server', 'place:test')).rejects.toThrow(/edit|client-N|all-clients|edit-and-clients/);
+    await expect(tools.resetSimulationState('server', undefined, undefined, 'place:test')).rejects.toThrow(/edit|client-N|all-clients|edit-and-clients/);
+    await expect(tools.resetSimulationState('edit', false, false, 'place:test')).rejects.toThrow(/network=true and\/or deviceSimulator=true/);
+  });
+
+  test('get_device_simulator_state defaults to the edit peer', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.getDeviceSimulatorState(undefined, undefined, undefined, 'place:test');
+    const pending = bridge.getPendingRequest('place:test', 'edit');
+    expect(pending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(pending?.request.data.code).toContain('StudioDeviceSimulatorService');
+    expect(pending?.request.data.code).toContain('GetDeviceAsync');
+    expect(pending?.request.data.code).toContain('GetDeviceListAsync');
+
+    bridge.resolveRequest(pending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        activeDeviceId: 'default',
+        isSimulating: false,
+        devices: [{ DeviceId: 'iphone_XR' }],
+      }),
+    });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      target: 'edit',
+      role: 'edit',
+      activeDeviceId: 'default',
+      isSimulating: false,
+      devices: [{ DeviceId: 'iphone_XR' }],
+    });
+  });
+
+  test('set_device_simulator fans out to connected clients only', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'server-1',
+      instanceId: 'place:test',
+      role: 'server',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-2',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.setDeviceSimulator('all-clients', 'iphone_XR', 'LandscapeRight', undefined, undefined, undefined, undefined, 'place:test');
+    const editPending = bridge.getPendingRequest('place:test', 'edit');
+    const serverPending = bridge.getPendingRequest('place:test', 'server');
+    const client1Pending = bridge.getPendingRequest('place:test', 'client-1');
+    const client2Pending = bridge.getPendingRequest('place:test', 'client-2');
+
+    expect(editPending).toBeNull();
+    expect(serverPending).toBeNull();
+    expect(client1Pending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(client2Pending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(client1Pending?.request.data.code).toContain('StudioDeviceSimulatorService');
+    expect(client1Pending?.request.data.code).toContain('SetDeviceAsync');
+    expect(client1Pending?.request.data.code).toContain('SetOrientationAsync');
+
+    const payload = {
+      success: true,
+      applied: { deviceId: 'iphone_XR', orientation: 'LandscapeRight' },
+      before: { activeDeviceId: 'default', isSimulating: false },
+      after: { activeDeviceId: 'iphone_XR', isSimulating: true },
+    };
+    bridge.resolveRequest(client1Pending!.requestId, { success: true, returnValue: JSON.stringify(payload) });
+    bridge.resolveRequest(client2Pending!.requestId, { success: true, returnValue: JSON.stringify(payload) });
+
+    const result = await resultPromise;
+    const body = JSON.parse(result.content[0].text);
+    expect(body).toMatchObject({
+      target: 'all-clients',
+      targets: {
+        'client-1': { applied: { deviceId: 'iphone_XR', orientation: 'LandscapeRight' } },
+        'client-2': { applied: { deviceId: 'iphone_XR', orientation: 'LandscapeRight' } },
+      },
+    });
+  });
+
+  test('set_device_simulator rejects server target and stopSimulation combinations', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    await expect(tools.setDeviceSimulator('server', 'iphone_XR', undefined, undefined, undefined, undefined, undefined, 'place:test')).rejects.toThrow(/edit|client-N/);
+    await expect(tools.setDeviceSimulator('edit', 'iphone_XR', undefined, undefined, undefined, undefined, true, 'place:test')).rejects.toThrow(/stopSimulation=true cannot be combined/);
+  });
+
+  test('set_device_simulator rejects the tool call when any fanout target fails', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+    bridge.registerInstance({
+      pluginSessionId: 'client-1',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+    bridge.registerInstance({
+      pluginSessionId: 'client-2',
+      instanceId: 'place:test',
+      role: 'client',
+      placeId: 0,
+      placeName: 'TestPlace',
+      dataModelName: 'TestPlace',
+      isRunning: true,
+    });
+
+    const resultPromise = tools.setDeviceSimulator('all-clients', 'iphone_XR', undefined, undefined, undefined, undefined, undefined, 'place:test');
+    const client1Pending = bridge.getPendingRequest('place:test', 'client-1');
+    const client2Pending = bridge.getPendingRequest('place:test', 'client-2');
+    bridge.resolveRequest(client1Pending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        success: true,
+        applied: { deviceId: 'iphone_XR' },
+        before: { activeDeviceId: 'default', isSimulating: false },
+        after: { activeDeviceId: 'iphone_XR', isSimulating: true },
+      }),
+    });
+    bridge.rejectRequest(client2Pending!.requestId, new Error('client-2 simulator failed'));
+
+    await expect(resultPromise).rejects.toThrow(/set_device_simulator failed.*client-2.*simulator failed/);
+  });
+
+  test('capture_device_matrix rejects unsupported targets', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    await expect(tools.captureDeviceMatrix([{ deviceId: 'iphone_XR' }], 'server', undefined, undefined, undefined, undefined, 'place:test')).rejects.toThrow(/edit|client-N/);
+    await expect(tools.captureDeviceMatrix([{ deviceId: 'iphone_XR' }], 'all-clients', undefined, undefined, undefined, undefined, 'place:test')).rejects.toThrow(/edit|client-N/);
+  });
+
+  test('capture_device_matrix rejects active custom device before mutating when restore is enabled', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.captureDeviceMatrix(
+      [{ label: 'phone', deviceId: 'iphone_XR' }],
+      'edit',
+      'jpeg',
+      80,
+      0,
+      true,
+      'place:test',
+    );
+
+    const snapshotPending = bridge.getPendingRequest('place:test', 'edit');
+    expect(snapshotPending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    bridge.resolveRequest(snapshotPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        activeDeviceId: 'custom_phone',
+        isSimulating: true,
+        devices: [{ DeviceId: 'iphone_XR', IsCustom: false }],
+      }),
+    });
+
+    await expect(resultPromise).rejects.toThrow(/cannot safely restore active custom device "custom_phone"/);
+    expect(bridge.getPendingRequest('place:test', 'edit')).toBeNull();
+  });
+
+  test('capture_device_matrix rejects the tool call when an entry capture fails', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.captureDeviceMatrix(
+      [{ label: 'phone', deviceId: 'iphone_XR' }],
+      'edit',
+      'jpeg',
+      80,
+      0,
+      true,
+      'place:test',
+    );
+
+    const snapshotPending = bridge.getPendingRequest('place:test', 'edit');
+    bridge.resolveRequest(snapshotPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ activeDeviceId: 'default', isSimulating: false, devices: [] }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const setPending = bridge.getPendingRequest('place:test', 'edit');
+    bridge.resolveRequest(setPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        success: true,
+        applied: { deviceId: 'iphone_XR' },
+        before: { activeDeviceId: 'default', isSimulating: false },
+        after: { activeDeviceId: 'iphone_XR', isSimulating: true },
+      }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const capturePending = bridge.getPendingRequest('place:test', 'edit');
+    expect(capturePending?.request).toMatchObject({ endpoint: '/api/capture-screenshot' });
+    bridge.resolveRequest(capturePending!.requestId, { error: 'screenshot boom' });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const restorePending = bridge.getPendingRequest('place:test', 'edit');
+    expect(restorePending?.request.data.code).toContain('StopSimulationAsync');
+    bridge.resolveRequest(restorePending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        success: true,
+        applied: { stopSimulation: true },
+        before: { activeDeviceId: 'iphone_XR', isSimulating: true },
+        after: { activeDeviceId: 'default', isSimulating: false },
+      }),
+    });
+
+    await expect(resultPromise).rejects.toThrow(/capture_device_matrix failed.*phone.*screenshot boom/);
+  });
+
+  test('capture_device_matrix rejects the tool call when restore fails', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.captureDeviceMatrix(
+      [{ label: 'phone', deviceId: 'iphone_XR' }],
+      'edit',
+      'jpeg',
+      80,
+      0,
+      true,
+      'place:test',
+    );
+
+    const snapshotPending = bridge.getPendingRequest('place:test', 'edit');
+    bridge.resolveRequest(snapshotPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ activeDeviceId: 'default', isSimulating: false, devices: [] }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const setPending = bridge.getPendingRequest('place:test', 'edit');
+    bridge.resolveRequest(setPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        success: true,
+        applied: { deviceId: 'iphone_XR' },
+        before: { activeDeviceId: 'default', isSimulating: false },
+        after: { activeDeviceId: 'iphone_XR', isSimulating: true },
+      }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const capturePending = bridge.getPendingRequest('place:test', 'edit');
+    bridge.resolveRequest(capturePending!.requestId, {
+      width: 1,
+      height: 1,
+      data: Buffer.from([0, 0, 0, 255]).toString('base64'),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const restorePending = bridge.getPendingRequest('place:test', 'edit');
+    expect(restorePending?.request.data.code).toContain('StopSimulationAsync');
+    bridge.rejectRequest(restorePending!.requestId, new Error('restore boom'));
+
+    await expect(resultPromise).rejects.toThrow(/capture_device_matrix failed.*restore.*restore boom/);
+  });
+
+  test('capture_device_matrix captures entries and restores prior state', async () => {
+    const bridge = new BridgeService();
+    const tools = new RobloxStudioTools(bridge);
+    bridge.registerInstance(READY);
+
+    const resultPromise = tools.captureDeviceMatrix(
+      [{ label: 'phone', deviceId: 'iphone_XR' }],
+      'edit',
+      'jpeg',
+      80,
+      0,
+      true,
+      'place:test',
+    );
+
+    const snapshotPending = bridge.getPendingRequest('place:test', 'edit');
+    expect(snapshotPending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    bridge.resolveRequest(snapshotPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({ activeDeviceId: 'default', isSimulating: false }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const setPending = bridge.getPendingRequest('place:test', 'edit');
+    expect(setPending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(setPending?.request.data.code).toContain('SetDeviceAsync');
+    bridge.resolveRequest(setPending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        success: true,
+        applied: { deviceId: 'iphone_XR' },
+        before: { activeDeviceId: 'default', isSimulating: false },
+        after: { activeDeviceId: 'iphone_XR', isSimulating: true },
+      }),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const capturePending = bridge.getPendingRequest('place:test', 'edit');
+    expect(capturePending?.request).toMatchObject({ endpoint: '/api/capture-screenshot' });
+    bridge.resolveRequest(capturePending!.requestId, {
+      width: 1,
+      height: 1,
+      data: Buffer.from([0, 0, 0, 255]).toString('base64'),
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const restorePending = bridge.getPendingRequest('place:test', 'edit');
+    expect(restorePending?.request).toMatchObject({ endpoint: '/api/execute-luau' });
+    expect(restorePending?.request.data.code).toContain('StopSimulationAsync');
+    bridge.resolveRequest(restorePending!.requestId, {
+      success: true,
+      returnValue: JSON.stringify({
+        success: true,
+        applied: { stopSimulation: true },
+        before: { activeDeviceId: 'iphone_XR', isSimulating: true },
+        after: { activeDeviceId: 'default', isSimulating: false },
+      }),
+    });
+
+    const result = await resultPromise;
+    const firstContent = result.content[0];
+    if (firstContent.type !== 'text') throw new Error('Expected matrix summary text first');
+    const summary = JSON.parse(firstContent.text);
+    expect(summary).toMatchObject({
+      target: 'edit',
+      role: 'edit',
+      restoreAfter: true,
+      entries: [{ label: 'phone', screenshot: { width: 1, height: 1, format: 'jpeg', quality: 80 } }],
+      restore: { applied: { stopSimulation: true } },
+    });
+    expect(result.content.some((item) => item.type === 'image')).toBe(true);
+  });
+});

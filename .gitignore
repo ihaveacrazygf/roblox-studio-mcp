@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tsbuildinfo
+studio-plugin/out/
+studio-plugin/*.rbxmx
+studio-plugin/include/*
+!studio-plugin/include/LibMP.lua
+.env
+.env.*
